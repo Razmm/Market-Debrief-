@@ -62,6 +62,15 @@ class Quote:
     market_state: str | None
 
 
+@dataclass
+class NewsItem:
+    title: str
+    link: str
+    source: str
+    symbols: list[str]
+    score: int
+
+
 def fetch_json(url: str, timeout: int = 20) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -166,29 +175,234 @@ def get_quotes_yfinance(symbols: list[str]) -> dict[str, Quote]:
     return quotes
 
 
+def rss_items(url: str, limit: int = 10) -> list[tuple[str, str, str]]:
+    try:
+        text = fetch_text(url)
+        root = ET.fromstring(text)
+    except Exception as exc:
+        print(f"rss fetch failed for {url}: {exc}", file=sys.stderr)
+        return []
+
+    rows: list[tuple[str, str, str]] = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        source = (item.findtext("source") or "").strip() or source_from_url(link)
+        if title and link:
+            rows.append((html.unescape(title), link, html.unescape(source)))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def rss_headlines(symbol: str | None = None, limit: int = 5) -> list[tuple[str, str]]:
     if symbol:
         params = urllib.parse.urlencode({"s": symbol, "region": "US", "lang": "en-US"})
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?{params}"
     else:
         url = "https://finance.yahoo.com/news/rssindex"
+    return [(title, link) for title, link, _source in rss_items(url, limit=limit)]
 
+
+def source_from_url(link: str) -> str:
     try:
-        text = fetch_text(url)
-        root = ET.fromstring(text)
-    except Exception as exc:
-        print(f"rss fetch failed for {symbol or 'market'}: {exc}", file=sys.stderr)
-        return []
+        host = urllib.parse.urlparse(link).netloc.lower()
+    except Exception:
+        return "source"
+    host = host.removeprefix("www.")
+    if "reuters" in host:
+        return "Reuters"
+    if "cnbc" in host:
+        return "CNBC"
+    if "marketwatch" in host:
+        return "MarketWatch"
+    if "bloomberg" in host:
+        return "Bloomberg"
+    if "apnews" in host:
+        return "AP"
+    if "finance.yahoo" in host:
+        return "Yahoo Finance"
+    if "investors.com" in host:
+        return "IBD"
+    if "barrons" in host:
+        return "Barron's"
+    return host or "source"
 
-    rows: list[tuple[str, str]] = []
-    for item in root.findall(".//item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        if title and link:
-            rows.append((html.unescape(title), link))
-        if len(rows) >= limit:
+
+def simplify_title(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
+
+def clean_news_title(title: str, source: str) -> str:
+    cleaned = html.unescape(title).strip()
+    if source:
+        cleaned = re.sub(rf"\s+-\s+{re.escape(source)}\s*$", "", cleaned, flags=re.I)
+    return cleaned
+
+
+def google_news_url(query: str) -> str:
+    params = urllib.parse.urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+    return f"https://news.google.com/rss/search?{params}"
+
+
+def impacted_symbols(title: str) -> list[str]:
+    text = title.lower()
+    impacts: list[str] = []
+    rules = {
+        "MSFT": ["microsoft", "azure", "cloud", "openai", "software"],
+        "UNH": ["unitedhealth", "healthcare", "medicare", "managed care", "insurance"],
+        "ODFL": ["fedex", "freight", "trucking", "logistics", "industrial", "transport"],
+        "MU": ["micron", "memory", "dram", "hbm", "chip", "semiconductor"],
+        "ADBE": ["adobe", "creative", "software", "ai agent", "agentic"],
+        "PYPL": ["paypal", "fintech", "payments", "consumer credit"],
+        "FSELX": ["chip", "semiconductor", "nvidia", "micron", "marvell", "ai"],
+        "BE": ["bloom energy", "fuel cell", "clean energy", "hydrogen", "power"],
+        "MRVL": ["marvell", "networking", "custom silicon", "asic", "chip"],
+        "NVDA": ["nvidia", "gpu", "ai chip", "semiconductor", "data center"],
+        "GOOG": ["alphabet", "google", "search", "cloud", "gemini", "youtube"],
+    }
+    for symbol, terms in rules.items():
+        if any(term in text for term in terms):
+            impacts.append(symbol)
+    return impacts[:5]
+
+
+def news_score(title: str, source: str) -> int:
+    text = f"{title} {source}".lower()
+    score = 0
+    source_weights = {
+        "reuters": 35,
+        "cnbc": 30,
+        "bloomberg": 30,
+        "ap": 25,
+        "marketwatch": 22,
+        "barron": 20,
+        "yahoo finance": 12,
+        "investor": 10,
+    }
+    for source_key, weight in source_weights.items():
+        if source_key in text:
+            score += weight
+    if not any(source_key in text for source_key in source_weights):
+        score -= 18
+
+    high_value_terms = [
+        "stock market",
+        "s&p 500",
+        "nasdaq",
+        "dow",
+        "futures",
+        "fed",
+        "federal reserve",
+        "treasury",
+        "yields",
+        "inflation",
+        "jobs",
+        "payrolls",
+        "earnings",
+        "oil",
+        "geopolitical",
+        "ai",
+        "semiconductor",
+        "chip",
+        "nvidia",
+        "microsoft",
+        "alphabet",
+    ]
+    for term in high_value_terms:
+        if term in text:
+            score += 8
+
+    low_value_terms = [
+        "millionaire",
+        "retirement",
+        "social security",
+        "credit card",
+        "mortgage rates",
+        "store",
+        "fashion",
+        "pump",
+        "buy now",
+        "zacks",
+        "morning squawk",
+        "march jobs",
+        "target earnings",
+        "opening bell",
+        "trump accounts",
+        "what happens to the stock market",
+    ]
+    for term in low_value_terms:
+        if term in text:
+            score -= 18
+    return score
+
+
+def news_category(title: str) -> str:
+    text = title.lower()
+    if re.search(r"\bfed\b|federal reserve|treasury|yield|inflation|jobs|payroll", text):
+        return "rates/macro"
+    if any(term in text for term in ["oil", "crude", "energy", "iran", "geopolitical"]):
+        return "oil/geopolitics"
+    if any(term in text for term in ["ai", "chip", "semiconductor", "nvidia", "micron", "marvell"]):
+        return "ai/semis"
+    if any(term in text for term in ["earnings", "revenue", "profit", "guidance"]):
+        return "earnings"
+    if any(term in text for term in ["s&p", "nasdaq", "dow", "stock market", "stocks"]):
+        return "market"
+    return "other"
+
+
+def market_news_articles(limit: int = 5) -> list[NewsItem]:
+    urls = [
+        "https://finance.yahoo.com/news/rssindex",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://www.cnbc.com/id/15839135/device/rss/rss.html",
+        "https://www.marketwatch.com/rss/topstories",
+        google_news_url("stock market today S&P 500 Nasdaq Dow Reuters CNBC when:1d"),
+        google_news_url("Federal Reserve Treasury yields stocks market Reuters CNBC when:1d"),
+        google_news_url("oil prices stocks market Reuters CNBC when:1d"),
+        google_news_url("AI semiconductor stocks Nvidia Micron Marvell market when:1d"),
+        google_news_url("market close stocks earnings economy jobs inflation when:1d"),
+    ]
+    items: list[NewsItem] = []
+    seen: set[str] = set()
+    for url in urls:
+        for title, link, source in rss_items(url, limit=8):
+            clean_title = clean_news_title(title, source)
+            key = simplify_title(clean_title)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            symbols = impacted_symbols(clean_title)
+            items.append(
+                NewsItem(
+                    title=clean_title,
+                    link=link,
+                    source=source,
+                    symbols=symbols,
+                    score=news_score(clean_title, source),
+                )
+            )
+
+    items.sort(key=lambda item: item.score, reverse=True)
+    selected: list[NewsItem] = []
+    category_counts: dict[str, int] = {}
+    for item in items:
+        category = news_category(item.title)
+        max_per_category = 2 if category in {"market", "rates/macro"} else 1
+        if category_counts.get(category, 0) >= max_per_category:
+            continue
+        selected.append(item)
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if len(selected) >= limit:
+            return selected
+
+    for item in items:
+        if item not in selected:
+            selected.append(item)
+        if len(selected) >= limit:
             break
-    return rows
+    return selected
 
 
 def finviz_low_peg(limit: int = 5) -> list[dict[str, str]]:
@@ -273,10 +487,89 @@ def resolve_kind(now: dt.datetime, requested: str) -> str | None:
     return None
 
 
+def sorted_quotes(quotes: dict[str, Quote], symbols: list[str]) -> list[Quote]:
+    rows = [quotes[symbol] for symbol in symbols if symbol in quotes and quotes[symbol].change_pct is not None]
+    return sorted(rows, key=lambda quote: quote.change_pct or 0, reverse=True)
+
+
+def move_label(quote: Quote) -> str:
+    return f"{quote.symbol}: {quote.name} - {fmt_num(quote.price)} ({fmt_pct(quote.change_pct)})"
+
+
+def why_news_matters(item: NewsItem) -> str:
+    if item.symbols:
+        return f"Read-through: relevant to {', '.join(item.symbols)}."
+    text = item.title.lower()
+    if re.search(r"\bfed\b|federal reserve|yield|treasury|inflation|jobs", text):
+        return "Read-through: affects rates, valuation multiples, and growth-stock appetite."
+    if any(term in text for term in ["oil", "energy", "geopolitical"]):
+        return "Read-through: watch inflation risk, consumer pressure, and risk appetite."
+    if any(term in text for term in ["nasdaq", "s&p", "dow", "market"]):
+        return "Read-through: broad tape signal for your watchlist."
+    return "Read-through: market sentiment item to keep on the radar."
+
+
+def theme_read(market_quotes: dict[str, Quote], holding_quotes: dict[str, Quote]) -> list[str]:
+    lines: list[str] = []
+    spy = market_quotes.get("SPY")
+    qqq = market_quotes.get("QQQ")
+    iwm = market_quotes.get("IWM")
+    oil = market_quotes.get("CL=F")
+
+    if qqq and spy and qqq.change_pct is not None and spy.change_pct is not None:
+        if qqq.change_pct > spy.change_pct + 0.5:
+            lines.append("Growth/AI led the tape: Nasdaq outperformed the S&P 500.")
+        elif spy.change_pct > qqq.change_pct + 0.5:
+            lines.append("The tape favored broader large caps over Nasdaq-heavy growth.")
+    if iwm and spy and iwm.change_pct is not None and spy.change_pct is not None:
+        if iwm.change_pct < spy.change_pct - 0.75:
+            lines.append("Small caps lagged, so breadth was weaker than the headline indexes suggest.")
+        elif iwm.change_pct > spy.change_pct + 0.75:
+            lines.append("Small caps outperformed, which points to broader risk appetite.")
+    if oil and oil.change_pct is not None and abs(oil.change_pct) >= 1.5:
+        direction = "rose" if oil.change_pct > 0 else "fell"
+        lines.append(f"Oil {direction} {fmt_pct(oil.change_pct)}, an important macro input for inflation and rates.")
+
+    movers = sorted_quotes(holding_quotes, HOLDINGS)
+    if movers:
+        winners = [quote.symbol for quote in movers[:3]]
+        losers = [quote.symbol for quote in sorted(movers, key=lambda quote: quote.change_pct or 0)[:3]]
+        lines.append(f"Your strongest names: {', '.join(winners)}.")
+        lines.append(f"Your weakest names: {', '.join(losers)}.")
+
+    semi_symbols = ["MU", "MRVL", "NVDA", "FSELX"]
+    semi_moves = [holding_quotes[s].change_pct for s in semi_symbols if s in holding_quotes and holding_quotes[s].change_pct is not None]
+    if len(semi_moves) >= 2:
+        avg = sum(semi_moves) / len(semi_moves)
+        lines.append(f"Semiconductor/AI basket average move: {fmt_pct(avg)} across {', '.join(semi_symbols)}.")
+
+    return lines or ["No single dominant theme stood out from the available quote data."]
+
+
+def alert_lines(holding_quotes: dict[str, Quote], peg_rows: list[dict[str, str]]) -> list[str]:
+    lines: list[str] = []
+    for quote in sorted_quotes(holding_quotes, HOLDINGS):
+        if quote.change_pct is None:
+            continue
+        if quote.change_pct >= 5:
+            lines.append(f"{quote.symbol}: up {fmt_pct(quote.change_pct)}; check if the move is news-driven or short-term momentum.")
+        elif quote.change_pct <= -3:
+            lines.append(f"{quote.symbol}: down {fmt_pct(quote.change_pct)}; check for company-specific news or sector pressure.")
+
+    peg_symbols = {row["ticker"] for row in peg_rows}
+    overlap = [symbol for symbol in HOLDINGS if symbol in peg_symbols]
+    if overlap:
+        lines.append(f"Low-PEG overlap in your holdings: {', '.join(overlap)}. Treat as a valuation flag, not a buy signal.")
+    if any(symbol in holding_quotes for symbol in ["MU", "MRVL", "NVDA", "FSELX"]):
+        lines.append("Concentration watch: several holdings are tied to the same AI/semiconductor factor.")
+    return lines[:6] or ["No major price-move alerts triggered from the available data."]
+
+
 def build_report(kind: str, now: dt.datetime) -> str:
     market_quotes = get_quotes(list(MARKET_SYMBOLS.values()))
     holding_quotes = get_quotes(HOLDINGS)
-    headlines = rss_headlines(limit=5)
+    market_news = market_news_articles(limit=5)
+    holding_news = {symbol: rss_headlines(symbol=symbol, limit=1) for symbol in HOLDINGS}
     peg_rows = finviz_low_peg(limit=5)
 
     title = "Morning Market Debrief" if kind == "morning" else "Evening Market Debrief"
@@ -286,8 +579,18 @@ def build_report(kind: str, now: dt.datetime) -> str:
         title.upper(),
         now.strftime("Generated %A, %B %-d, %Y at %-I:%M %p ET"),
         "",
-        setup_label.upper(),
+        "TOP 5 MARKET NEWS ARTICLES",
     ]
+
+    if market_news:
+        for index, item in enumerate(market_news, start=1):
+            lines.append(f"{index}. {item.title} - {item.source}")
+            lines.append(f"   {item.link}")
+            lines.append(f"   {why_news_matters(item)}")
+    else:
+        lines.append("- Market news feed unavailable in this run.")
+
+    lines.extend(["", setup_label.upper()])
 
     for label, symbol in MARKET_SYMBOLS.items():
         quote = market_quotes.get(symbol)
@@ -296,12 +599,21 @@ def build_report(kind: str, now: dt.datetime) -> str:
         else:
             lines.append(f"- {label}: n/a")
 
-    lines.extend(["", "TOP MARKET NEWS"])
-    if headlines:
-        for title_text, link in headlines:
-            lines.append(f"- {title_text} ({link})")
+    lines.extend(["", "PORTFOLIO PULSE"])
+    for line in theme_read(market_quotes, holding_quotes):
+        lines.append(f"- {line}")
+
+    movers = sorted_quotes(holding_quotes, HOLDINGS)
+    lines.extend(["", "YOUR BIGGEST MOVERS"])
+    if movers:
+        for quote in movers[:5]:
+            lines.append(f"- {move_label(quote)}")
+        losers = sorted(movers, key=lambda quote: quote.change_pct or 0)[:3]
+        lines.append("Weakest names:")
+        for quote in losers:
+            lines.append(f"- {move_label(quote)}")
     else:
-        lines.append("- News feed unavailable in this run.")
+        lines.append("- Holding quote data unavailable in this run.")
 
     lines.extend(["", "YOUR HOLDINGS"])
     for symbol in HOLDINGS:
@@ -311,12 +623,19 @@ def build_report(kind: str, now: dt.datetime) -> str:
         else:
             lines.append(f"- {symbol}: quote unavailable")
 
-    lines.extend(["", "HOLDINGS HEADLINES"])
+    lines.extend(["", "HOLDINGS NEWS"])
     for symbol in HOLDINGS:
-        items = rss_headlines(symbol=symbol, limit=1)
+        items = holding_news.get(symbol, [])
         if items:
             title_text, link = items[0]
-            lines.append(f"- {symbol}: {title_text} ({link})")
+            lines.append(f"- {symbol}: {title_text}")
+            lines.append(f"  {link}")
+        else:
+            lines.append(f"- {symbol}: no fresh linked headline found in this run.")
+
+    lines.extend(["", "ALERTS AND RISK FLAGS"])
+    for line in alert_lines(holding_quotes, peg_rows):
+        lines.append(f"- {line}")
 
     lines.extend(["", "TOP 5 LOWEST POSITIVE PEG SCREEN"])
     if peg_rows:
@@ -336,10 +655,11 @@ def build_report(kind: str, now: dt.datetime) -> str:
             [
                 "",
                 "WHAT TO WATCH TODAY",
-                "- Index direction after the open, especially Nasdaq versus Dow.",
-                "- Treasury yields and oil, since both can drive risk appetite.",
+                "- Which of the top news items actually moves futures and rates after the open.",
+                "- Nasdaq versus Russell 2000: leadership quality and breadth.",
+                "- Treasury yields and oil, since both can drive valuation and inflation risk.",
                 "- AI/chip leadership across NVDA, MU, MRVL, and FSELX.",
-                "- Company-specific headlines for your holdings.",
+                "- Any company-specific headlines listed above that develop during the session.",
             ]
         )
     else:
@@ -347,9 +667,11 @@ def build_report(kind: str, now: dt.datetime) -> str:
             [
                 "",
                 "WHAT TO WATCH TOMORROW",
-                "- Whether today's leaders hold after-hours and pre-market.",
-                "- Overnight macro/geopolitical headlines.",
+                "- Whether today's biggest market headlines keep driving futures overnight.",
+                "- Whether Nasdaq leadership broadens or stays concentrated in mega-cap/AI.",
+                "- Overnight macro/geopolitical headlines, especially oil and rates.",
                 "- Any earnings, analyst actions, or guidance changes tied to your holdings.",
+                "- Reversals in today's biggest holding movers.",
             ]
         )
 
