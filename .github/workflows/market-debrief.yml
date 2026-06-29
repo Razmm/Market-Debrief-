@@ -1,0 +1,45 @@
+name: Market debrief email
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "Which debrief to send"
+        required: true
+        default: "morning"
+        type: choice
+        options:
+          - morning
+          - evening
+          - auto
+  schedule:
+    - cron: "30 12 * * 1-5"
+    - cron: "30 13 * * 1-5"
+    - cron: "30 21 * * 1-5"
+    - cron: "30 22 * * 1-5"
+
+jobs:
+  send-market-debrief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send debrief email
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          KIND="${{ github.event.inputs.kind || 'auto' }}"
+          python debrief.py --kind "$KIND"
