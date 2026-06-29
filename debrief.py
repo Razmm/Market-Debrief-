@@ -71,6 +71,28 @@ class NewsItem:
     score: int
 
 
+@dataclass
+class CalendarEvent:
+    date: dt.date
+    time_et: str
+    country: str
+    event: str
+    consensus: str
+    previous: str
+    score: int
+    sort_time: int
+
+
+@dataclass
+class EarningsEvent:
+    symbol: str
+    name: str
+    date: dt.date
+    time: str
+    eps_forecast: str
+    source: str
+
+
 def fetch_json(url: str, timeout: int = 20) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -94,6 +116,274 @@ def fmt_pct(value: float | None) -> str:
         return "n/a"
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.2f}%"
+
+
+def clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = html.unescape(str(value)).replace("\xa0", " ")
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    text = re.sub(r"<.*?>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return "" if text in {"&nbsp;", "nbsp", "N/A", "-"} else text
+
+
+def week_bounds(now: dt.datetime) -> tuple[dt.date, dt.date]:
+    start = now.date() - dt.timedelta(days=now.weekday())
+    end = start + dt.timedelta(days=4)
+    return start, end
+
+
+def date_range(start: dt.date, end: dt.date) -> list[dt.date]:
+    days = (end - start).days
+    return [start + dt.timedelta(days=offset) for offset in range(days + 1)]
+
+
+def format_event_day(day: dt.date) -> str:
+    return day.strftime("%a %-m/%-d")
+
+
+def nasdaq_calendar_json(calendar: str, day: dt.date) -> dict:
+    date_text = day.isoformat()
+    url = f"https://api.nasdaq.com/api/calendar/{calendar}?date={date_text}"
+    return fetch_json(url)
+
+
+def gmt_to_et_label(day: dt.date, gmt_text: str) -> str:
+    text = clean_text(gmt_text)
+    if not text or not re.match(r"^\d{1,2}:\d{2}$", text):
+        return "time n/a"
+    hour, minute = [int(part) for part in text.split(":", 1)]
+    utc_time = dt.datetime(day.year, day.month, day.day, hour, minute, tzinfo=dt.timezone.utc)
+    et_time = utc_time.astimezone(ZoneInfo("America/New_York"))
+    return et_time.strftime("%-I:%M %p ET")
+
+
+def gmt_to_et_parts(day: dt.date, gmt_text: object) -> tuple[dt.date, str, int]:
+    text = clean_text(gmt_text)
+    if not text or not re.match(r"^\d{1,2}:\d{2}$", text):
+        return day, "time n/a", 24 * 60
+    hour, minute = [int(part) for part in text.split(":", 1)]
+    utc_time = dt.datetime(day.year, day.month, day.day, hour, minute, tzinfo=dt.timezone.utc)
+    et_time = utc_time.astimezone(ZoneInfo("America/New_York"))
+    return et_time.date(), et_time.strftime("%-I:%M %p ET"), et_time.hour * 60 + et_time.minute
+
+
+def market_calendar_time_parts(day: dt.date, time_text: object) -> tuple[dt.date, str, int]:
+    text = clean_text(time_text)
+    if not text or not re.match(r"^\d{1,2}:\d{2}$", text):
+        return day, "time n/a", 24 * 60
+    hour, minute = [int(part) for part in text.split(":", 1)]
+    meridiem = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return day, f"{display_hour}:{minute:02d} {meridiem} ET", hour * 60 + minute
+
+
+def economic_event_score(country: str, event: str) -> int:
+    text = f"{country} {event}".lower()
+    score = 0
+    if country == "United States":
+        score += 5
+    elif country in {"China", "Euro Zone", "Germany", "United Kingdom", "Japan"}:
+        score += 2
+
+    keyword_scores = {
+        "fomc": 7,
+        "federal reserve": 7,
+        "fed ": 6,
+        "powell": 6,
+        "cpi": 7,
+        "pce": 7,
+        "payroll": 7,
+        "nonfarm": 7,
+        "unemployment": 6,
+        "jobless claims": 5,
+        "jolts": 5,
+        "gdp": 6,
+        "ism": 6,
+        "pmi": 5,
+        "retail sales": 5,
+        "consumer confidence": 5,
+        "durable goods": 4,
+        "housing": 4,
+        "treasury": 4,
+        "auction": 2,
+        "beige book": 5,
+        "minutes": 5,
+        "ecb": 5,
+        "boj": 4,
+        "opec": 4,
+    }
+    for keyword, points in keyword_scores.items():
+        if keyword in text:
+            score += points
+    if "bill auction" in text and not any(term in text for term in ["10-year", "20-year", "30-year"]):
+        score -= 3
+    if "dallas fed" in text or "richmond fed" in text or "chicago fed" in text:
+        score -= 3
+    return score
+
+
+def weekly_economic_calendar(now: dt.datetime, limit: int = 8) -> list[CalendarEvent]:
+    start, end = week_bounds(now)
+    events: list[CalendarEvent] = []
+    seen: set[tuple[dt.date, str, str]] = set()
+
+    for day in date_range(start, end):
+        try:
+            data = nasdaq_calendar_json("economicevents", day)
+        except Exception as exc:
+            print(f"economic calendar fetch failed for {day}: {exc}", file=sys.stderr)
+            continue
+        for row in data.get("data", {}).get("rows", []) or []:
+            country = clean_text(row.get("country"))
+            event = clean_text(row.get("eventName"))
+            if not country or not event:
+                continue
+            event_lower = event.lower()
+            if country == "Germany" and not event_lower.startswith("german"):
+                continue
+            ignored_event_parts = [
+                "n.s.a",
+                "private nonfarm",
+                "government payroll",
+                "manufacturing payroll",
+                "u6 unemployment",
+                "ism manufacturing employment",
+                "ism manufacturing new orders",
+                "ism manufacturing prices",
+                "continuing jobless",
+                "4-week",
+                "reserve balances",
+            ]
+            if any(part in event_lower for part in ignored_event_parts):
+                continue
+            score = economic_event_score(country, event)
+            major_global_countries = {"China", "Euro Zone", "Germany", "United Kingdom", "Japan"}
+            threshold = 9 if country == "United States" or country in major_global_countries else 12
+            if score < threshold:
+                continue
+            event_day, time_et, sort_time = market_calendar_time_parts(day, row.get("gmt", ""))
+            key = (event_day, country, event)
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append(
+                CalendarEvent(
+                    date=event_day,
+                    time_et=time_et,
+                    country=country,
+                    event=event,
+                    consensus=clean_text(row.get("consensus")) or "n/a",
+                    previous=clean_text(row.get("previous")) or "n/a",
+                    score=score,
+                    sort_time=sort_time,
+                )
+            )
+
+    events.sort(key=lambda item: (-item.score, item.date, item.sort_time, item.event))
+    selected = events[:limit]
+    selected.sort(key=lambda item: (item.date, item.sort_time, -item.score, item.event))
+    return selected
+
+
+def normalize_earnings_time(value: str) -> str:
+    text = clean_text(value).lower().replace("time-", "").replace("-", " ")
+    if text == "pre market":
+        return "before open"
+    if text == "after hours":
+        return "after close"
+    if text == "not supplied":
+        return "time n/a"
+    return text or "time n/a"
+
+
+def weekly_holding_earnings(now: dt.datetime) -> list[EarningsEvent]:
+    start, end = week_bounds(now)
+    holding_set = {symbol for symbol in HOLDINGS if symbol != "FSELX"}
+    events: list[EarningsEvent] = []
+
+    for day in date_range(start, end):
+        try:
+            data = nasdaq_calendar_json("earnings", day)
+        except Exception as exc:
+            print(f"earnings calendar fetch failed for {day}: {exc}", file=sys.stderr)
+            continue
+        for row in data.get("data", {}).get("rows", []) or []:
+            symbol = clean_text(row.get("symbol")).upper()
+            if symbol not in holding_set:
+                continue
+            events.append(
+                EarningsEvent(
+                    symbol=symbol,
+                    name=clean_text(row.get("name")) or DISPLAY_NAMES.get(symbol, symbol),
+                    date=day,
+                    time=normalize_earnings_time(row.get("time", "")),
+                    eps_forecast=clean_text(row.get("epsForecast")) or "n/a",
+                    source="Nasdaq",
+                )
+            )
+
+    events.sort(key=lambda item: (item.date, item.symbol))
+    return events
+
+
+def parse_yfinance_earnings_date(value: object) -> dt.date | None:
+    if value is None:
+        return None
+    if isinstance(value, list) and value:
+        return parse_yfinance_earnings_date(value[0])
+    if isinstance(value, tuple) and value:
+        return parse_yfinance_earnings_date(value[0])
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if hasattr(value, "to_pydatetime"):
+        try:
+            return value.to_pydatetime().date()
+        except Exception:
+            return None
+    return None
+
+
+def upcoming_holding_earnings(now: dt.datetime, limit: int = 8) -> list[EarningsEvent]:
+    try:
+        import yfinance as yf  # type: ignore
+    except Exception:
+        return []
+
+    today = now.date()
+    max_day = today + dt.timedelta(days=120)
+    events: list[EarningsEvent] = []
+    for symbol in HOLDINGS:
+        if symbol == "FSELX":
+            continue
+        try:
+            calendar = yf.Ticker(symbol).calendar
+        except Exception as exc:
+            print(f"earnings date fetch failed for {symbol}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(calendar, dict):
+            continue
+        earnings_date = parse_yfinance_earnings_date(calendar.get("Earnings Date"))
+        if not earnings_date or earnings_date < today or earnings_date > max_day:
+            continue
+        eps_average = calendar.get("Earnings Average")
+        eps_forecast = fmt_num(float(eps_average), 2) if isinstance(eps_average, (int, float)) else "n/a"
+        events.append(
+            EarningsEvent(
+                symbol=symbol,
+                name=DISPLAY_NAMES.get(symbol, symbol),
+                date=earnings_date,
+                time="time n/a",
+                eps_forecast=eps_forecast,
+                source="Yahoo Finance",
+            )
+        )
+
+    events.sort(key=lambda item: (item.date, item.symbol))
+    return events[:limit]
 
 
 def get_quotes(symbols: list[str]) -> dict[str, Quote]:
@@ -569,11 +859,15 @@ def build_report(kind: str, now: dt.datetime) -> str:
     market_quotes = get_quotes(list(MARKET_SYMBOLS.values()))
     holding_quotes = get_quotes(HOLDINGS)
     market_news = market_news_articles(limit=5)
+    weekly_events = weekly_economic_calendar(now, limit=12)
+    weekly_earnings = weekly_holding_earnings(now)
+    upcoming_earnings = upcoming_holding_earnings(now, limit=8)
     holding_news = {symbol: rss_headlines(symbol=symbol, limit=1) for symbol in HOLDINGS}
     peg_rows = finviz_low_peg(limit=5)
 
     title = "Morning Market Debrief" if kind == "morning" else "Evening Market Debrief"
     setup_label = "Pre-market setup" if kind == "morning" else "Market close recap"
+    week_start, week_end = week_bounds(now)
 
     lines = [
         title.upper(),
@@ -589,6 +883,43 @@ def build_report(kind: str, now: dt.datetime) -> str:
             lines.append(f"   {why_news_matters(item)}")
     else:
         lines.append("- Market news feed unavailable in this run.")
+
+    lines.extend(["", f"THIS WEEK'S MARKET CALENDAR ({format_event_day(week_start)}-{format_event_day(week_end)})"])
+    if weekly_events:
+        for event in weekly_events:
+            details = []
+            if event.consensus != "n/a":
+                details.append(f"consensus {event.consensus}")
+            if event.previous != "n/a":
+                details.append(f"prior {event.previous}")
+            suffix = f" ({'; '.join(details)})" if details else ""
+            lines.append(f"- {format_event_day(event.date)} {event.time_et}: {event.country} - {event.event}{suffix}")
+    else:
+        lines.append("- Major economic calendar feed unavailable or no high-priority events found.")
+
+    lines.extend(["", "YOUR HOLDING EARNINGS CALENDAR"])
+    if weekly_earnings:
+        lines.append("This week:")
+        for item in weekly_earnings:
+            lines.append(
+                f"- {format_event_day(item.date)} {item.time}: {item.symbol} - {item.name} "
+                f"(EPS estimate {item.eps_forecast}, source {item.source})"
+            )
+    else:
+        lines.append("- No earnings dates found for your individual stock holdings this week.")
+
+    if upcoming_earnings:
+        weekly_keys = {(item.symbol, item.date) for item in weekly_earnings}
+        next_items = [item for item in upcoming_earnings if (item.symbol, item.date) not in weekly_keys]
+        if next_items:
+            lines.append("Next known holding dates:")
+            for item in next_items[:6]:
+                lines.append(
+                    f"- {format_event_day(item.date)}: {item.symbol} - {item.name} "
+                    f"(EPS estimate {item.eps_forecast}, source {item.source})"
+                )
+    else:
+        lines.append("- Next holding earnings dates unavailable in this run.")
 
     lines.extend(["", setup_label.upper()])
 
