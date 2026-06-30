@@ -13,6 +13,9 @@ on:
           - evening
           - auto
   schedule:
+    # GitHub schedules use UTC. These cover 8:30 AM and 5:30 PM ET in both
+    # daylight and standard time; the script only sends during the matching
+    # New York hour to avoid off-hour duplicate emails.
     - cron: "30 12 * * 1-5"
     - cron: "30 13 * * 1-5"
     - cron: "30 21 * * 1-5"
@@ -40,6 +43,45 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          INPUT_KIND: ${{ github.event.inputs.kind || 'auto' }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
         run: |
-          KIND="${{ github.event.inputs.kind || 'auto' }}"
+          KIND="$(python - <<'PY'
+          import os
+          import datetime as dt
+          from zoneinfo import ZoneInfo
+
+          requested = os.environ.get("INPUT_KIND", "auto")
+          schedule = os.environ.get("EVENT_SCHEDULE", "")
+
+          if requested != "auto":
+              print(requested)
+              raise SystemExit
+
+          if not schedule:
+              print("auto")
+              raise SystemExit
+
+          now = dt.datetime.now(ZoneInfo("America/New_York"))
+          is_dst = bool(now.dst())
+
+          daylight_slots = {
+              "30 12 * * 1-5": "morning",
+              "30 21 * * 1-5": "evening",
+          }
+          standard_slots = {
+              "30 13 * * 1-5": "morning",
+              "30 22 * * 1-5": "evening",
+          }
+
+          active_slots = daylight_slots if is_dst else standard_slots
+          print(active_slots.get(schedule, "skip"))
+          PY
+          )"
+
+          if [ "$KIND" = "skip" ]; then
+            echo "Skipping backup schedule slot for the current New York time offset."
+            exit 0
+          fi
+
           python debrief.py --kind "$KIND"
